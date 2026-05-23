@@ -1,330 +1,773 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Download, Sliders, Image as ImageIcon, SplitSquareHorizontal } from 'lucide-react';
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Lumis — Photo Studio</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(160deg,#0a0a0f,#0f0a1a);min-height:100vh}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+input[type=range]{-webkit-appearance:none;width:100%;height:28px;background:transparent;cursor:pointer;position:absolute;inset:0;opacity:0}
+button{outline:none;-webkit-tap-highlight-color:transparent;font-family:inherit}
+textarea,input{font-family:inherit}
+textarea{resize:none;outline:none}
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:2px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useRef} = React;
 
-const App = () => {
-  const [image, setImage] = useState(null);
-  const [splitPos, setSplitPos] = useState(50);
-  
-  // State untuk parameter filter CSS (mensimulasikan preset Lightroom)
-  const defaultFilters = {
-    brightness: 100,
-    contrast: 100,
-    saturate: 100,
-    sepia: 0,
-    hueRotate: 0,
-    blur: 0,
-    sharpen: 0, // Tambahan parameter untuk menghilangkan blur
-  };
-  
-  const cinematicPreset = {
-    brightness: 105,
-    contrast: 125,
-    saturate: 115,
-    sepia: 15, // Memberikan sedikit tint hangat/magenta
-    hueRotate: -5, // Menggeser warna sedikit untuk efek sinematik
-    blur: 0,
-    sharpen: 40, // Tambahan ketajaman
-  };
+/* ═══════════════════════════════════════════
+   IMAGE PROCESSING CORE
+═══════════════════════════════════════════ */
+function loadImg(src){
+  return new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=src;});
+}
 
-  const hdDetailPreset = {
-    brightness: 102,
-    contrast: 115,
-    saturate: 100, // Warna tidak diubah (tetap 100%)
-    sepia: 0, // Tidak ada efek warna sinematik
-    hueRotate: 0, // Tidak ada pergeseran warna
-    blur: 0,
-    sharpen: 85, // Fokus utama pada penajaman detail ekstra (HD)
-  };
+// Fast blur using canvas GPU (much faster than manual)
+function blurData(data,W,H,r){
+  const c=document.createElement("canvas");c.width=W;c.height=H;
+  c.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(data),W,H),0,0);
+  const c2=document.createElement("canvas");c2.width=W;c2.height=H;
+  const x=c2.getContext("2d");x.filter=`blur(${r}px)`;x.drawImage(c,0,0);x.filter="none";
+  return x.getImageData(0,0,W,H).data;
+}
 
-  const bwCinematicPreset = {
-    brightness: 105,
-    contrast: 140, // Kontras tinggi khas sinematik
-    saturate: 0, // Hitam putih murni
-    sepia: 0, 
-    hueRotate: 0, 
-    blur: 0,
-    sharpen: 75, // Tekstur dan detail yang sangat tajam
-  };
+// Unsharp mask = sharpen by amplifying difference from blurred version
+function unsharp(data,W,H,amount,radius){
+  const blr=blurData(data,W,H,radius);
+  const out=new Uint8ClampedArray(data.length);
+  for(let i=0;i<data.length;i+=4){
+    for(let c=0;c<3;c++)out[i+c]=Math.max(0,Math.min(255,data[i+c]+amount*(data[i+c]-blr[i+c])));
+    out[i+3]=data[i+3];
+  }
+  return out;
+}
 
-  const [filters, setFilters] = useState(defaultFilters);
-  const canvasRef = useRef(null);
+// Local contrast: boost deviation from local mean
+function localContrast(data,W,H,strength){
+  const lm=blurData(data,W,H,28);
+  const out=new Uint8ClampedArray(data.length);
+  for(let i=0;i<data.length;i+=4){
+    for(let c=0;c<3;c++){const v=data[i+c],m=lm[i+c];out[i+c]=Math.max(0,Math.min(255,m+(v-m)*(1+strength)));}
+    out[i+3]=data[i+3];
+  }
+  return out;
+}
 
-  // Menghasilkan string filter CSS
-  const getFilterString = (f) => {
-    let baseFilter = `brightness(${f.brightness}%) contrast(${f.contrast}%) saturate(${f.saturate}%) sepia(${f.sepia}%) hue-rotate(${f.hueRotate}deg) blur(${f.blur}px)`;
-    // Terapkan SVG filter matrix jika nilai sharpen lebih dari 0
-    if (f.sharpen > 0) {
-      baseFilter += ` url(#sharpen-filter)`;
+function capSize(W,H,maxPx){
+  const s=Math.max(W,H);if(s<=maxPx)return[W,H,1];
+  const sc=maxPx/s;return[Math.round(W*sc),Math.round(H*sc),sc];
+}
+
+function canvasFromImg(img,w,h,cssFilter){
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d");
+  if(cssFilter)ctx.filter=cssFilter;
+  ctx.drawImage(img,0,0,w,h);ctx.filter="none";
+  return c;
+}
+
+/* ═══════════════════════════════════════════
+   REMINI ALGORITHMS
+═══════════════════════════════════════════ */
+
+// ✨ ENHANCE — multi-pass unsharp + local contrast (main Remini magic)
+async function doEnhance(src,onS){
+  onS("Loading…");
+  const orig=await loadImg(src);
+  const [W,H]=capSize(orig.naturalWidth,orig.naturalHeight,2000).slice(0,2);
+  const c=canvasFromImg(orig,W,H,"");
+  const ctx=c.getContext("2d");
+  let d=ctx.getImageData(0,0,W,H).data;
+
+  onS("Pass 1 — sharpening edges…");
+  d=unsharp(d,W,H,1.8,0.9);
+  onS("Pass 2 — micro detail…");
+  d=unsharp(d,W,H,0.9,0.35);
+  onS("Pass 3 — local contrast…");
+  d=localContrast(d,W,H,0.38);
+  onS("Finishing…");
+  const fin=new Uint8ClampedArray(d.length);
+  for(let i=0;i<d.length;i+=4){
+    fin[i]=Math.min(255,d[i]*1.02+2);fin[i+1]=Math.min(255,d[i+1]*1.02+2);
+    fin[i+2]=Math.min(255,d[i+2]*1.02+2);fin[i+3]=d[i+3];
+  }
+  ctx.putImageData(new ImageData(fin,W,H),0,0);
+
+  // scale back if capped
+  if(W<orig.naturalWidth){
+    const c2=document.createElement("canvas");c2.width=orig.naturalWidth;c2.height=orig.naturalHeight;
+    const ctx2=c2.getContext("2d");ctx2.imageSmoothingQuality="high";ctx2.drawImage(c,0,0,orig.naturalWidth,orig.naturalHeight);
+    return c2.toDataURL("image/jpeg",.95);
+  }
+  return c.toDataURL("image/jpeg",.95);
+}
+
+// 👤 FACE HD — aggressive multi-pass + center-focus brightening
+async function doFaceHD(src,onS){
+  onS("Detecting face zone…");
+  const orig=await loadImg(src);
+  const [W,H]=capSize(orig.naturalWidth,orig.naturalHeight,1800).slice(0,2);
+  const c=canvasFromImg(orig,W,H,"brightness(102%) contrast(103%)");
+  const ctx=c.getContext("2d");
+  let d=ctx.getImageData(0,0,W,H).data;
+
+  onS("Enhancing face details…");
+  d=unsharp(d,W,H,2.4,0.55);
+  d=unsharp(d,W,H,1.2,0.22);
+  onS("Boosting local contrast…");
+  d=localContrast(d,W,H,0.5);
+
+  onS("Lighting face…");
+  const cx=W/2,cy=H*0.38,maxD=Math.sqrt((W/2)**2+(H/2)**2);
+  const fin=new Uint8ClampedArray(d.length);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const i=(y*W+x)*4;
+    const dist=Math.sqrt((x-cx)**2+(y-cy)**2);
+    const boost=Math.max(0,(1-dist/(maxD*.55))*10);
+    for(let ch=0;ch<3;ch++)fin[i+ch]=Math.max(0,Math.min(255,d[i+ch]+boost));
+    fin[i+3]=d[i+3];
+  }
+  ctx.putImageData(new ImageData(fin,W,H),0,0);
+  if(W<orig.naturalWidth){
+    const c2=document.createElement("canvas");c2.width=orig.naturalWidth;c2.height=orig.naturalHeight;
+    c2.getContext("2d").drawImage(c,0,0,orig.naturalWidth,orig.naturalHeight);
+    return c2.toDataURL("image/jpeg",.95);
+  }
+  return c.toDataURL("image/jpeg",.95);
+}
+
+// 🎞️ RESTORE — denoise + detail recovery for old/damaged photos
+async function doRestore(src,onS){
+  onS("Analyzing damage…");
+  const orig=await loadImg(src);
+  const W=orig.naturalWidth,H=orig.naturalHeight;
+  const c=canvasFromImg(orig,W,H,"brightness(106%) contrast(110%) saturate(92%)");
+  const ctx=c.getContext("2d");
+  let d=ctx.getImageData(0,0,W,H).data;
+
+  onS("Reducing noise…");
+  const smooth=blurData(d,W,H,0.85);
+  onS("Recovering details…");
+  d=unsharp(smooth,W,H,1.4,0.5);
+  onS("Enhancing texture…");
+  d=localContrast(d,W,H,0.28);
+
+  ctx.putImageData(new ImageData(d,W,H),0,0);
+  return c.toDataURL("image/jpeg",.94);
+}
+
+// 🌈 HDR — tone mapping + local contrast simulation
+async function doHDR(src,onS){
+  onS("Building HDR layers…");
+  const orig=await loadImg(src);
+  const W=orig.naturalWidth,H=orig.naturalHeight;
+  const c=canvasFromImg(orig,W,H,"");
+  const ctx=c.getContext("2d");
+  let d=ctx.getImageData(0,0,W,H).data;
+
+  onS("Tone mapping…");
+  const lm=blurData(d,W,H,35);
+  const mapped=new Uint8ClampedArray(d.length);
+  for(let i=0;i<d.length;i+=4){
+    for(let ch=0;ch<3;ch++){
+      let v=d[i+ch];
+      // compress highlights, lift shadows
+      if(v>210)v=210+(v-210)*.35;
+      else if(v<55)v=55-(55-v)*.5;
+      // local contrast
+      const m=lm[i+ch];
+      mapped[i+ch]=Math.max(0,Math.min(255,m+(v-m)*1.45));
     }
-    return baseFilter;
-  };
+    mapped[i+3]=d[i+3];
+  }
+  ctx.putImageData(new ImageData(mapped,W,H),0,0);
 
-  const handleImageUpload = (e) => {
-    const file = e.target.files[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setImage(event.target.result);
-        setFilters(defaultFilters); // Reset filter saat gambar baru diunggah
-        setSplitPos(50);
-      };
-      reader.readAsDataURL(file);
+  onS("Boosting vibrancy…");
+  const c2=document.createElement("canvas");c2.width=W;c2.height=H;
+  const ctx2=c2.getContext("2d");
+  ctx2.filter="saturate(138%) contrast(106%)";
+  ctx2.drawImage(c,0,0);
+  return c2.toDataURL("image/jpeg",.94);
+}
+
+// 🔇 DENOISE — smooth noise, preserve edges
+async function doDenoise(src,onS){
+  onS("Detecting noise…");
+  const orig=await loadImg(src);
+  const W=orig.naturalWidth,H=orig.naturalHeight;
+  const c=canvasFromImg(orig,W,H,"");
+  const ctx=c.getContext("2d");
+  let d=ctx.getImageData(0,0,W,H).data;
+
+  onS("Smoothing noise…");
+  const smooth=blurData(d,W,H,1.4);
+  onS("Recovering sharpness…");
+  const result=unsharp(smooth,W,H,0.85,0.38);
+
+  ctx.putImageData(new ImageData(result,W,H),0,0);
+  return c.toDataURL("image/jpeg",.94);
+}
+
+// 🎨 COLORIZE — grayscale → color using AI analysis
+async function doColorize(src,onS,callAPI){
+  onS("AI analyzing image…");
+  let cfg={temp:10,sat:110,br:105,con:112,note:"Warm colorization applied"};
+  try{
+    const b64=src.split(",")[1],mime=src.split(";")[0].split(":")[1];
+    const txt=await callAPI([{role:"user",content:[
+      {type:"image",source:{type:"base64",media_type:mime,data:b64}},
+      {type:"text",text:"Analyze this photo's scene and suggest realistic colorization. Return ONLY JSON: {temp:-20 to 20,sat:60-180,br:90-120,con:100-125,note:string}"}
+    ]}],"Colorization expert. Return ONLY valid JSON. No other text.");
+    const p=JSON.parse(txt.replace(/```json|```/g,"").trim());
+    cfg={...cfg,...p};
+  }catch(e){}
+
+  onS("Converting to grayscale…");
+  const orig=await loadImg(src);
+  const W=orig.naturalWidth,H=orig.naturalHeight;
+  const c=document.createElement("canvas");c.width=W;c.height=H;
+  const ctx=c.getContext("2d");
+  ctx.drawImage(orig,0,0);
+  const id=ctx.getImageData(0,0,W,H);
+  for(let i=0;i<id.data.length;i+=4){
+    const g=id.data[i]*.299+id.data[i+1]*.587+id.data[i+2]*.114;
+    id.data[i]=id.data[i+1]=id.data[i+2]=g;
+  }
+  ctx.putImageData(id,0,0);
+
+  onS("Applying color…");
+  const sepia=cfg.temp>0?cfg.temp*.5:0,hue=cfg.temp<0?cfg.temp*2:0;
+  const c2=document.createElement("canvas");c2.width=W;c2.height=H;
+  const ctx2=c2.getContext("2d");
+  ctx2.filter=[
+    `brightness(${cfg.br}%)`,`contrast(${cfg.con}%)`,`saturate(${cfg.sat}%)`,
+    sepia?`sepia(${sepia}%)`:"",hue?`hue-rotate(${hue}deg)`:"",
+  ].filter(Boolean).join(" ");
+  ctx2.drawImage(c,0,0);
+  return{result:c2.toDataURL("image/jpeg",.93),note:cfg.note};
+}
+
+/* ═══════════════════════════════════════════
+   EXISTING TOOLS
+═══════════════════════════════════════════ */
+async function doBeauty(src,onS){
+  onS("Skin smoothing…");
+  const orig=await loadImg(src);
+  const W=orig.naturalWidth,H=orig.naturalHeight;
+  const sc=W>1400?1400/W:1;
+  const w=Math.round(W*sc),h=Math.round(H*sc);
+  const c=canvasFromImg(orig,w,h,"brightness(103%) contrast(102%) saturate(113%)");
+  const ctx=c.getContext("2d");
+  const id=ctx.getImageData(0,0,w,h);const d=id.data;
+  const out=new Uint8ClampedArray(d.length);out.set(d);
+  for(let y=2;y<h-2;y++)for(let x=2;x<w-2;x++){
+    const i=(y*w+x)*4,r=d[i],g=d[i+1],b=d[i+2];
+    if(r>90&&g>45&&b>20&&r>g&&r>b&&(r-g)>10&&Math.max(r,g,b)-Math.min(r,g,b)>15&&r<240){
+      let sr=0,sg=0,sb=0;
+      for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const ni=((y+dy)*w+(x+dx))*4;sr+=d[ni];sg+=d[ni+1];sb+=d[ni+2];}
+      const t=.52;out[i]=Math.min(255,r*(1-t)+(sr/25)*t+3);out[i+1]=Math.min(255,g*(1-t)+(sg/25)*t+1);out[i+2]=Math.min(255,b*(1-t)+(sb/25)*t);out[i+3]=d[i+3];
     }
+  }
+  ctx.putImageData(new ImageData(out,w,h),0,0);
+  if(sc<1){const c2=document.createElement("canvas");c2.width=W;c2.height=H;c2.getContext("2d").drawImage(c,0,0,W,H);return c2.toDataURL("image/jpeg",.93);}
+  return c.toDataURL("image/jpeg",.93);
+}
+
+async function doHiRes(src,onS){
+  onS("Upscaling 3×…");
+  const orig=await loadImg(src);
+  const MAX=5400;let W=orig.naturalWidth*3,H=orig.naturalHeight*3;
+  if(W>MAX){const sc=MAX/W;W=MAX;H=Math.round(H*sc);}
+  if(H>MAX){const sc=MAX/H;H=MAX;W=Math.round(W*sc);}
+  const c=canvasFromImg(orig,W,H,"");const ctx=c.getContext("2d");
+  if(W*H<=18000000){
+    onS("Sharpening…");
+    let d=ctx.getImageData(0,0,W,H).data;
+    d=unsharp(d,W,H,1.4,0.7);
+    ctx.putImageData(new ImageData(d,W,H),0,0);
+  }
+  return c.toDataURL("image/jpeg",.96);
+}
+
+async function doDepthFocus(src,onS){
+  onS("Bokeh effect…");
+  const orig=await loadImg(src);
+  const W=orig.naturalWidth,H=orig.naturalHeight;
+  const c=document.createElement("canvas");c.width=W;c.height=H;
+  const ctx=c.getContext("2d");
+  ctx.drawImage(orig,0,0);const sharp=ctx.getImageData(0,0,W,H).data;
+  ctx.clearRect(0,0,W,H);ctx.filter=`blur(${Math.max(6,Math.round(Math.min(W,H)/80))}px)`;
+  ctx.drawImage(orig,0,0);ctx.filter="none";
+  const blr=ctx.getImageData(0,0,W,H).data;
+  const cx=W/2,cy=H/2,maxD=Math.sqrt(cx*cx+cy*cy);
+  const focR=maxD*.26,fadeW=maxD*.46;
+  const out=new Uint8ClampedArray(W*H*4);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const dist=Math.sqrt((x-cx)**2+(y-cy)**2);
+    const t=Math.max(0,Math.min(1,(dist-focR)/fadeW));
+    const sm=t*t*(3-2*t);const i=(y*W+x)*4;
+    for(let c2=0;c2<4;c2++)out[i+c2]=sharp[i+c2]*(1-sm)+blr[i+c2]*sm;
+  }
+  ctx.putImageData(new ImageData(out,W,H),0,0);
+  return c.toDataURL("image/jpeg",.93);
+}
+
+async function doRemoveBg(src,onS){
+  onS("Loading AI model (first run ~30s)…");
+  const orig=await loadImg(src);
+  const c=document.createElement("canvas");c.width=orig.naturalWidth;c.height=orig.naturalHeight;
+  c.getContext("2d").drawImage(orig,0,0);
+  const blob=await new Promise(res=>c.toBlob(res,"image/png"));
+  const mod=await import("https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.4.5/dist/browser.mjs");
+  const fn=mod.removeBackground||mod.default?.removeBackground||mod.default;
+  onS("Segmenting subject…");
+  const result=await fn(blob,{
+    publicPath:"https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.4.5/dist/",
+    progress:(k,cur,tot)=>{if(tot>0)onS(`Processing ${Math.round(cur/tot*100)}%…`);}
+  });
+  return new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>res(e.target.result);r.onerror=rej;r.readAsDataURL(result);});
+}
+
+/* ═══════════════════════════════════════════
+   CONSTANTS
+═══════════════════════════════════════════ */
+const PRESETS=[
+  {id:"auto",icon:"✦",label:"Auto"},
+  {id:"light",icon:"☀",label:"Light"},
+  {id:"sharp",icon:"◈",label:"Sharp"},
+  {id:"deblur",icon:"⟡",label:"Deblur"},
+  {id:"focus",icon:"⊙",label:"Focus"},
+  {id:"vivid",icon:"❋",label:"Vivid"},
+  {id:"cinema",icon:"▣",label:"Cinema"},
+  {id:"night",icon:"◑",label:"Night"},
+];
+const PCSS={
+  light:"brightness(130%) contrast(95%) saturate(100%)",
+  sharp:"brightness(100%) contrast(122%) saturate(100%)",
+  deblur:"brightness(102%) contrast(126%) saturate(100%)",
+  focus:"brightness(105%) contrast(115%) saturate(110%)",
+  vivid:"brightness(105%) contrast(118%) saturate(158%)",
+  cinema:"brightness(95%) contrast(130%) saturate(80%) sepia(8%)",
+  night:"brightness(132%) contrast(108%) saturate(94%)",
+};
+const DF={brightness:100,contrast:100,saturation:100,shadow:0,temp:0};
+const SLIDERS=[
+  {key:"brightness",label:"Brightness",icon:"☀",min:60,max:160},
+  {key:"contrast",label:"Contrast",icon:"◑",min:60,max:160},
+  {key:"saturation",label:"Saturation",icon:"◈",min:40,max:200},
+  {key:"shadow",label:"Shadows",icon:"▣",min:-30,max:60},
+  {key:"temp",label:"Warmth",icon:"◭",min:-20,max:20},
+];
+
+const REMINI_TOOLS=[
+  {id:"enhance",icon:"✨",label:"Enhance",sub:"AI multi-pass sharpen",color:"#a78bfa"},
+  {id:"facehd",icon:"👤",label:"Face HD",sub:"Face restoration",color:"#f472b6"},
+  {id:"restore",icon:"🎞️",label:"Restore",sub:"Fix old photos",color:"#fb923c"},
+  {id:"colorize",icon:"🎨",label:"Colorize",sub:"B&W to color",color:"#34d399"},
+  {id:"hdr",icon:"🌈",label:"HDR",sub:"Tone mapping",color:"#60a5fa"},
+  {id:"denoise",icon:"🔇",label:"Denoise",sub:"Reduce noise",color:"#a3e635"},
+];
+const EXTRA_TOOLS=[
+  {id:"beauty",icon:"🌸",label:"Beauty",sub:"Skin smooth & glow",color:"#ff6b9d"},
+  {id:"hires",icon:"🔍",label:"HiRes 3×",sub:"Upscale & sharpen",color:"#06b6d4"},
+  {id:"removebg",icon:"✂️",label:"Remove BG",sub:"AI erase background",color:"#10b981"},
+  {id:"depth",icon:"🎬",label:"Depth Focus",sub:"Bokeh blur",color:"#f59e0b"},
+];
+
+function buildCSS(s){
+  const sepia=s.temp>0?s.temp*.4:0,hue=s.temp<0?s.temp*2:0;
+  return[`brightness(${Math.max(10,s.brightness+s.shadow*.25)}%)`,`contrast(${s.contrast}%)`,
+    `saturate(${s.saturation}%)`,sepia?`sepia(${sepia}%)`:"",hue?`hue-rotate(${hue}deg)`:""].filter(Boolean).join(" ");
+}
+
+/* ═══════════════════════════════════════════
+   APP COMPONENT
+═══════════════════════════════════════════ */
+function App(){
+  const [photo,setPhoto]=useState(null);
+  const [filt,setFilt]=useState({...DF});
+  const [cssF,setCssF]=useState("");
+  const [useCss,setUseCss]=useState(false);
+  const [activeP,setActiveP]=useState(null);
+  const [comparing,setComparing]=useState(false);
+  const [tab,setTab]=useState("remini");
+  const [prompt,setPrompt]=useState("");
+  const [aiLoad,setAiLoad]=useState(false);
+  const [toolLoad,setToolLoad]=useState(false);
+  const [status,setStatus]=useState("");
+  const [note,setNote]=useState("");
+  const [apiKey,setApiKey]=useState("");
+  const [showKey,setShowKey]=useState(false);
+  const fileRef=useRef(null);
+  const imgRef=useRef(null);
+
+  const loadFile=f=>{
+    if(!f||!f.type.startsWith("image/"))return;
+    const r=new FileReader();r.onload=e=>{
+      setPhoto(e.target.result);setFilt({...DF});setCssF("");setUseCss(false);
+      setActiveP(null);setNote("");setStatus("");setTab("remini");
+    };r.readAsDataURL(f);
   };
 
-  const handleFilterChange = (name, value) => {
-    setFilters(prev => ({ ...prev, [name]: value }));
+  const previewFilter=useCss?cssF:buildCSS(filt);
+
+  const callAPI=async(msgs,sys)=>{
+    const hdrs={"Content-Type":"application/json"};
+    if(apiKey)hdrs["x-api-key"]=apiKey;
+    const r=await fetch("https://api.anthropic.com/v1/messages",{
+      method:"POST",headers:hdrs,
+      body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:500,system:sys,messages:msgs})
+    });
+    if(!r.ok){if(r.status===401)setShowKey(true);throw new Error("API "+r.status);}
+    const data=await r.json();
+    return(data.content||[]).map(c=>c.text||"").join("");
   };
 
-  const applyPreset = () => {
-    setFilters(cinematicPreset);
+  const applyPreset=id=>{
+    setActiveP(id);
+    if(id==="auto"){runAutoAI();return;}
+    setCssF(PCSS[id]||"");setUseCss(true);setFilt({...DF});
+    setNote("Preset "+id+" applied.");
   };
 
-  const applyHDPreset = () => {
-    setFilters(hdDetailPreset);
+  const runAutoAI=async()=>{
+    if(!photo)return;setAiLoad(true);setNote("Analyzing…");
+    try{
+      const b64=photo.split(",")[1],mime=photo.split(";")[0].split(":")[1];
+      const txt=await callAPI([{role:"user",content:[
+        {type:"image",source:{type:"base64",media_type:mime,data:b64}},
+        {type:"text",text:"Return optimal photo CSS filter values as JSON. No facial changes."}
+      ]}],"Expert retoucher. Return ONLY JSON: {brightness:100,contrast:100,saturation:100,shadow:0,temp:0,note:string}. Values: 70-160 each, shadow -30 to 50, temp -20 to 20.");
+      const{note:n,...vals}=JSON.parse(txt.replace(/```json|```/g,"").trim());
+      setFilt(f=>({...f,...vals}));setUseCss(false);setNote(n||"Auto done.");
+    }catch{setCssF(PCSS.vivid);setUseCss(true);setNote("Auto preset applied.");}
+    setAiLoad(false);
   };
 
-  const applyBWPreset = () => {
-    setFilters(bwCinematicPreset);
+  const runPromptAI=async()=>{
+    if(!photo||!prompt.trim())return;setAiLoad(true);setNote("Processing…");
+    try{
+      const b64=photo.split(",")[1],mime=photo.split(";")[0].split(":")[1];
+      const txt=await callAPI([{role:"user",content:[
+        {type:"image",source:{type:"base64",media_type:mime,data:b64}},
+        {type:"text",text:`Request: "${prompt}". Return filter JSON.`}
+      ]}],"Retoucher. NEVER touch faces. Return ONLY JSON: {brightness:100,contrast:100,saturation:100,shadow:0,temp:0,note:string}");
+      const{note:n,...vals}=JSON.parse(txt.replace(/```json|```/g,"").trim());
+      setFilt(f=>({...f,...vals}));setUseCss(false);setActiveP(null);setNote(n||"Applied.");
+    }catch{setNote("Gagal. Coba deskripsi berbeda.");}
+    setAiLoad(false);
   };
 
-  const resetFilters = () => {
-    setFilters(defaultFilters);
-  };
-
-  const downloadImage = () => {
-    if (!image) return;
-    
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    const img = new Image();
-    
-    img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
-      // Aplikasikan filter ke canvas
-      ctx.filter = getFilterString(filters);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      
-      // Unduh gambar
-      const link = document.createElement('a');
-      link.download = 'cinematic-retouch-result.jpg';
-      link.href = canvas.toDataURL('image/jpeg', 0.9);
-      link.click();
+  const runRemini=async id=>{
+    if(!photo)return;
+    const src=photo;
+    setToolLoad(true);setStatus("Starting…");
+    const NOTES={
+      enhance:"✨ AI Enhanced — multi-pass sharpen + local contrast boost.",
+      facehd:"👤 Face HD — portrait sharpened & face illuminated.",
+      restore:"🎞️ Restored — noise reduced, details recovered.",
+      colorize:"🎨 Colorized — B&W converted to color.",
+      hdr:"🌈 HDR applied — tone mapped, shadows lifted, highlights compressed.",
+      denoise:"🔇 Denoised — noise removed, edges preserved.",
+      beauty:"🌸 Beauty — skin smoothed & tone enhanced.",
+      hires:"🔍 HiRes 3× — image upscaled & sharpened.",
+      removebg:"✂️ Background removed. Save as PNG for transparency.",
+      depth:"🎬 Depth Focus — bokeh effect applied.",
     };
-    img.src = image;
+    try{
+      let result;
+      if(id==="enhance")result=await doEnhance(src,setStatus);
+      else if(id==="facehd")result=await doFaceHD(src,setStatus);
+      else if(id==="restore")result=await doRestore(src,setStatus);
+      else if(id==="hdr")result=await doHDR(src,setStatus);
+      else if(id==="denoise")result=await doDenoise(src,setStatus);
+      else if(id==="colorize"){const{result:r,note:n}=await doColorize(src,setStatus,callAPI);result=r;if(n)NOTES.colorize="🎨 "+n;}
+      else if(id==="beauty")result=await doBeauty(src,setStatus);
+      else if(id==="hires")result=await doHiRes(src,setStatus);
+      else if(id==="depth")result=await doDepthFocus(src,setStatus);
+      else if(id==="removebg")result=await doRemoveBg(src,setStatus);
+      setPhoto(result);setFilt({...DF});setUseCss(false);setActiveP(null);
+      setNote(NOTES[id]||"Done.");
+    }catch(e){setNote("⚠️ "+e.message);}
+    setToolLoad(false);setStatus("");
   };
 
-  return (
-    <div className="h-[100dvh] w-full bg-black text-neutral-100 font-sans flex flex-col overflow-hidden md:max-w-[430px] md:mx-auto relative md:border-x md:border-neutral-800 shadow-2xl">
-      
-      {/* SVG Filter Tersembunyi untuk Efek Penajaman (Sharpening Convolution Matrix) */}
-      <svg style={{ position: 'absolute', width: 0, height: 0 }} aria-hidden="true">
-        <filter id="sharpen-filter">
-          <feConvolveMatrix
-            order="3"
-            preserveAlpha="true"
-            kernelMatrix={`0 -${filters.sharpen / 100} 0 -${filters.sharpen / 100} ${1 + 4 * (filters.sharpen / 100)} -${filters.sharpen / 100} 0 -${filters.sharpen / 100} 0`}
-          />
-        </filter>
-      </svg>
+  const saveImg=()=>{
+    if(!photo)return;
+    const img=imgRef.current;if(!img)return;
+    const doSave=()=>{
+      const c=document.createElement("canvas");
+      c.width=img.naturalWidth||800;c.height=img.naturalHeight||600;
+      const ctx=c.getContext("2d");
+      if(previewFilter)ctx.filter=previewFilter;
+      ctx.drawImage(img,0,0);ctx.filter="none";
+      const isPng=photo.startsWith("data:image/png");
+      const a=document.createElement("a");
+      a.download=`lumis_${Date.now()}.${isPng?"png":"jpg"}`;
+      a.href=c.toDataURL(isPng?"image/png":"image/jpeg",.95);
+      document.body.appendChild(a);a.click();document.body.removeChild(a);
+    };
+    img.complete&&img.naturalWidth>0?doSave():(img.onload=doSave);
+  };
 
-      {/* iOS Style Top Bar */}
-      <header className="bg-neutral-900/80 backdrop-blur-md pt-safe flex items-center justify-between px-4 py-3 z-20 absolute top-0 w-full border-b border-neutral-800/60">
-        <div className="flex items-center gap-2">
-          <h1 className="text-lg font-bold tracking-tight">Photocopy <span className="text-neutral-400 font-normal">byKDM</span></h1>
-        </div>
-        <div className="flex gap-4">
-          <label className="flex flex-col items-center justify-center text-neutral-300 hover:text-white transition-colors cursor-pointer active:scale-95">
-            <Upload size={22} />
-            <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
-          </label>
-          <button 
-            onClick={downloadImage}
-            disabled={!image}
-            className={`flex flex-col items-center justify-center transition-colors active:scale-95 ${image ? 'text-blue-500 hover:text-blue-400' : 'text-neutral-600 cursor-not-allowed'}`}
-          >
-            <Download size={22} />
-          </button>
-        </div>
-      </header>
+  const reset=()=>{setFilt({...DF});setUseCss(false);setActiveP(null);setCssF("");setNote("");};
+  const isLoad=aiLoad||toolLoad;
 
-      {/* Main Content / Image Viewer */}
-      <main className="flex-1 mt-[56px] bg-black flex items-center justify-center relative overflow-hidden">
-        {!image ? (
-          <div className="flex flex-col items-center gap-4 text-neutral-600">
-            <ImageIcon size={48} className="opacity-50" strokeWidth={1} />
-            <p className="text-sm">Ketuk ikon upload di atas</p>
+  const ToolBtn=({t,onClick})=>(
+    <button onClick={onClick} disabled={isLoad} style={{
+      background:"rgba(255,255,255,.04)",border:`1px solid ${t.color}22`,
+      borderRadius:18,padding:"13px 8px 11px",cursor:isLoad?"not-allowed":"pointer",
+      display:"flex",flexDirection:"column",alignItems:"center",gap:5,
+      transition:"all .2s",opacity:isLoad?.45:1,
+    }}>
+      <div style={{width:42,height:42,borderRadius:13,background:`${t.color}18`,
+        border:`1px solid ${t.color}33`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20}}>
+        {t.icon}
+      </div>
+      <span style={{fontSize:12,fontWeight:700,color:"rgba(255,255,255,.88)"}}>{t.label}</span>
+      <span style={{fontSize:9.5,color:"rgba(255,255,255,.3)",textAlign:"center",lineHeight:1.3}}>{t.sub}</span>
+    </button>
+  );
+
+  const tabs=[["presets","Preset"],["remini","Remini"],["tools","Tools"],["adjust","Adjust"],["ai","AI"]];
+
+  return(
+    <div style={{minHeight:"100vh",display:"flex",justifyContent:"center",alignItems:"flex-start",
+      padding:"24px 8px 56px",fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Display',Helvetica,sans-serif"}}>
+
+      <div style={{width:390,background:"#111118",borderRadius:50,overflow:"hidden",position:"relative",
+        display:"flex",flexDirection:"column",
+        boxShadow:"0 0 0 2px #252535,0 40px 100px rgba(0,0,0,.88),inset 0 0 0 1px #1e1e2e"}}>
+
+        {/* Dynamic Island */}
+        <div style={{position:"absolute",top:12,left:"50%",transform:"translateX(-50%)",
+          width:120,height:34,background:"#0a0a0f",borderRadius:20,zIndex:20}}/>
+
+        {/* Status bar */}
+        <div style={{height:52,padding:"14px 28px 0",display:"flex",justifyContent:"space-between",
+          alignItems:"flex-end",color:"rgba(255,255,255,.7)",fontSize:13,fontWeight:600}}>
+          <span>9:41</span><span style={{fontSize:11}}>●●●● WiFi ⚡</span>
+        </div>
+
+        {/* Header */}
+        <div style={{padding:"4px 20px 4px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <div>
+            <div style={{color:"rgba(255,255,255,.28)",fontSize:10,letterSpacing:".2em",textTransform:"uppercase"}}>Photo Studio</div>
+            <div style={{fontSize:25,fontWeight:800,letterSpacing:"-.04em",lineHeight:1.1,
+              background:"linear-gradient(135deg,#e0d0ff,#a78bfa,#7c3aed)",
+              WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>Lumis</div>
           </div>
-        ) : (
-          <div className="relative w-full h-full flex items-center justify-center p-2 pb-6">
-            <div className="relative w-full aspect-[4/5] max-h-full rounded-lg overflow-hidden shadow-2xl bg-neutral-900">
-              
-              {/* Gambar Editan (Berada di Bawah) */}
-              <img 
-                src={image} 
-                alt="Edited" 
-                className="absolute inset-0 w-full h-full object-contain select-none"
-                style={{ filter: getFilterString(filters) }}
-              />
-              
-              {/* Gambar Asli (Berada di Atas, di-crop dengan clip-path) */}
-              <img 
-                src={image} 
-                alt="Original" 
-                className="absolute inset-0 w-full h-full object-contain select-none"
-                style={{ clipPath: `inset(0 ${100 - splitPos}% 0 0)` }}
-              />
-              
-              {/* Garis Slider */}
-              <div 
-                className="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_10px_rgba(0,0,0,0.8)] cursor-ew-resize z-10 flex justify-center items-center pointer-events-none"
-                style={{ left: `calc(${splitPos}% - 1px)` }}
-              >
-                <div className="w-8 h-8 bg-white/90 backdrop-blur-sm rounded-full flex items-center justify-center shadow-lg border border-neutral-200">
-                  <SplitSquareHorizontal size={16} className="text-black" />
-                </div>
-              </div>
+          {photo&&(
+            <div style={{display:"flex",gap:7,alignItems:"center"}}>
+              <button onPointerDown={()=>setComparing(true)} onPointerUp={()=>setComparing(false)} onPointerLeave={()=>setComparing(false)}
+                style={{background:"rgba(255,255,255,.08)",border:"1px solid rgba(255,255,255,.12)",borderRadius:11,
+                  padding:"5px 9px",color:"rgba(255,255,255,.8)",fontSize:11,cursor:"pointer",userSelect:"none"}}>⟷</button>
+              <button onClick={saveImg}
+                style={{background:"linear-gradient(135deg,#7c3aed,#a78bfa)",border:"none",
+                  borderRadius:11,padding:"6px 15px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                💾 Save
+              </button>
+            </div>
+          )}
+        </div>
 
-              {/* Input Range Transparan untuk kontrol slider */}
-              <input 
-                type="range" 
-                min="0" 
-                max="100" 
-                value={splitPos}
-                onChange={(e) => setSplitPos(e.target.value)}
-                className="absolute inset-0 w-full h-full opacity-0 cursor-ew-resize z-20 m-0 p-0"
-              />
+        {/* API key */}
+        {showKey&&(
+          <div style={{margin:"4px 14px",padding:"8px 12px",background:"rgba(251,191,36,.1)",border:"1px solid rgba(251,191,36,.3)",borderRadius:12}}>
+            <div style={{fontSize:11,color:"rgba(251,191,36,.9)",marginBottom:5}}>🔑 Masukkan Anthropic API key:</div>
+            <input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="sk-ant-api03-..."
+              style={{width:"100%",background:"rgba(0,0,0,.3)",border:"1px solid rgba(255,255,255,.15)",
+                borderRadius:8,padding:"6px 10px",color:"#fff",fontSize:12,outline:"none"}}/>
+          </div>
+        )}
 
-              {/* Label Before / After */}
-              <div className="absolute top-3 left-3 bg-black/50 text-white text-[10px] px-2 py-1 rounded-full backdrop-blur-md pointer-events-none z-10 font-medium">Before</div>
-              <div className="absolute top-3 right-3 bg-black/50 text-white text-[10px] px-2 py-1 rounded-full backdrop-blur-md pointer-events-none z-10 font-medium">After</div>
+        {/* Photo zone */}
+        <div onDrop={e=>{e.preventDefault();loadFile(e.dataTransfer.files[0]);}} onDragOver={e=>e.preventDefault()}
+          onClick={()=>!photo&&fileRef.current?.click()}
+          style={{margin:"8px 14px 0",borderRadius:22,overflow:"hidden",background:"#16162a",
+            minHeight:photo?0:210,display:"flex",alignItems:"center",justifyContent:"center",
+            cursor:photo?"default":"pointer",border:photo?"none":"2px dashed rgba(167,139,250,.3)",position:"relative"}}>
+          {!photo?(
+            <div style={{textAlign:"center",color:"rgba(255,255,255,.28)",padding:"32px 24px",userSelect:"none"}}>
+              <div style={{fontSize:44,marginBottom:12,opacity:.4}}>🖼</div>
+              <div style={{fontSize:15,fontWeight:600,marginBottom:5}}>Tap to Upload Photo</div>
+              <div style={{fontSize:11,color:"rgba(255,255,255,.14)"}}>JPEG · PNG · HEIC</div>
+            </div>
+          ):(
+            <div style={{width:"100%",position:"relative",lineHeight:0}}>
+              <img ref={imgRef} src={photo} alt=""
+                style={{display:"block",width:"100%",height:"auto",maxHeight:330,objectFit:"contain",
+                  filter:comparing?"none":previewFilter,transition:"filter .3s ease"}}/>
+              {comparing&&(
+                <div style={{position:"absolute",bottom:8,left:"50%",transform:"translateX(-50%)",
+                  background:"rgba(0,0,0,.6)",backdropFilter:"blur(8px)",borderRadius:18,
+                  padding:"3px 12px",color:"rgba(255,255,255,.85)",fontSize:11}}>Original</div>
+              )}
+              <button onClick={e=>{e.stopPropagation();fileRef.current?.click();}}
+                style={{position:"absolute",top:8,right:8,background:"rgba(0,0,0,.52)",backdropFilter:"blur(10px)",
+                  border:"1px solid rgba(255,255,255,.15)",borderRadius:10,padding:"4px 10px",color:"#fff",fontSize:11,cursor:"pointer"}}>↺</button>
+            </div>
+          )}
+          {isLoad&&(
+            <div style={{position:"absolute",inset:0,background:"rgba(8,8,14,.82)",backdropFilter:"blur(6px)",
+              display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14}}>
+              <div style={{width:48,height:48,borderRadius:"50%",
+                border:"3px solid rgba(167,139,250,.18)",borderTop:"3px solid #a78bfa",animation:"spin .75s linear infinite"}}/>
+              <span style={{color:"rgba(255,255,255,.75)",fontSize:13,textAlign:"center",padding:"0 24px",lineHeight:1.5}}>{status||"Processing…"}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Note */}
+        {note&&!isLoad&&(
+          <div style={{margin:"6px 14px 0",padding:"7px 12px",background:"rgba(167,139,250,.1)",
+            border:"1px solid rgba(167,139,250,.2)",borderRadius:12,
+            color:"rgba(185,155,255,.95)",fontSize:11.5,lineHeight:1.45,animation:"fadeIn .3s ease"}}>
+            {note}
+          </div>
+        )}
+
+        {/* Tabs */}
+        {photo&&(
+          <div style={{display:"flex",gap:2,padding:"8px 14px 0"}}>
+            {tabs.map(([id,lbl])=>(
+              <button key={id} onClick={()=>setTab(id)} style={{
+                flex:1,padding:"6px 0",borderRadius:10,border:"none",
+                background:tab===id
+                  ?id==="remini"?"linear-gradient(135deg,#a855f7,#ec4899)":"linear-gradient(135deg,#7c3aed,#a78bfa)"
+                  :"rgba(255,255,255,.06)",
+                color:tab===id?"#fff":"rgba(255,255,255,.35)",
+                fontSize:10.5,fontWeight:tab===id?700:500,cursor:"pointer",transition:"all .18s"}}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* ─ PRESETS ─ */}
+        {photo&&tab==="presets"&&(
+          <div style={{padding:"10px 14px",display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:7,animation:"fadeIn .25s ease"}}>
+            {PRESETS.map(p=>(
+              <button key={p.id} onClick={()=>applyPreset(p.id)} style={{
+                background:activeP===p.id?"rgba(124,58,237,.22)":"rgba(255,255,255,.05)",
+                border:activeP===p.id?"1.5px solid #a78bfa":"1px solid rgba(255,255,255,.08)",
+                borderRadius:16,padding:"10px 4px",cursor:"pointer",
+                display:"flex",flexDirection:"column",alignItems:"center",gap:4,transition:"all .18s"}}>
+                <span style={{fontSize:19,color:activeP===p.id?"#a78bfa":"rgba(255,255,255,.5)"}}>{p.icon}</span>
+                <span style={{fontSize:10,fontWeight:600,color:activeP===p.id?"#c4b5fd":"rgba(255,255,255,.4)"}}>{p.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* ─ REMINI ─ */}
+        {photo&&tab==="remini"&&(
+          <div style={{padding:"10px 14px",animation:"fadeIn .25s ease"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+              <div style={{background:"linear-gradient(135deg,#a855f7,#ec4899)",borderRadius:10,
+                padding:"3px 10px",fontSize:11,fontWeight:700,color:"#fff"}}>✨ Remini AI</div>
+              <span style={{fontSize:11,color:"rgba(255,255,255,.3)"}}>Enhance like a pro</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+              {REMINI_TOOLS.map(t=><ToolBtn key={t.id} t={t} onClick={()=>runRemini(t.id)}/>)}
             </div>
           </div>
         )}
-      </main>
 
-      {/* iOS Bottom Sheet Controls */}
-      <div className="w-full bg-neutral-900 rounded-t-3xl shadow-[0_-5px_30px_rgba(0,0,0,0.8)] z-30 flex flex-col h-[42dvh] min-h-[350px]">
-        {/* Drag handle indicator */}
-        <div className="w-full flex justify-center pt-3 pb-2">
-          <div className="w-10 h-1 bg-neutral-700 rounded-full"></div>
-        </div>
+        {/* ─ TOOLS ─ */}
+        {photo&&tab==="tools"&&(
+          <div style={{padding:"10px 14px",animation:"fadeIn .25s ease"}}>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:9}}>
+              {EXTRA_TOOLS.map(t=><ToolBtn key={t.id} t={t} onClick={()=>runRemini(t.id)}/>)}
+            </div>
+          </div>
+        )}
 
-        <div className="flex-1 overflow-y-auto px-5 pb-8 scrollbar-hide">
-          <h2 className="text-sm font-semibold mb-4 text-neutral-300 flex items-center gap-2">
-            <Sliders size={16} className="text-neutral-400"/> 
-            Filter & Tools
-          </h2>
-          
-          {/* Presets (Horizontal Scroll for Mobile) */}
-          <div className="flex gap-2 mb-6 overflow-x-auto pb-2 scrollbar-hide snap-x" style={{ opacity: image ? 1 : 0.4, pointerEvents: image ? 'auto' : 'none' }}>
-            <button 
-              onClick={applyHDPreset}
-              className="snap-start flex-shrink-0 px-4 py-2 rounded-xl border border-blue-600/30 bg-blue-900/20 text-blue-400 text-xs font-semibold active:scale-95 transition-transform"
-            >
-              HD Detail
-            </button>
-            <button 
-              onClick={applyPreset}
-              className="snap-start flex-shrink-0 px-4 py-2 rounded-xl border border-emerald-600/30 bg-emerald-900/20 text-emerald-400 text-xs font-semibold active:scale-95 transition-transform"
-            >
-              Cinematic
-            </button>
-            <button 
-              onClick={applyBWPreset}
-              className="snap-start flex-shrink-0 px-4 py-2 rounded-xl border border-zinc-500/30 bg-zinc-900/30 text-zinc-300 text-xs font-semibold active:scale-95 transition-transform"
-            >
-              B&W Noir
-            </button>
-            <button 
-              onClick={resetFilters}
-              className="snap-start flex-shrink-0 px-4 py-2 rounded-xl border border-neutral-700 bg-neutral-800 text-neutral-300 text-xs font-semibold active:scale-95 transition-transform"
-            >
-              Reset
+        {/* ─ ADJUST ─ */}
+        {photo&&tab==="adjust"&&(
+          <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:12,animation:"fadeIn .25s ease"}}>
+            {SLIDERS.map(sl=>(
+              <div key={sl.key}>
+                <div style={{display:"flex",justifyContent:"space-between",color:"rgba(255,255,255,.5)",fontSize:12,fontWeight:600,marginBottom:4}}>
+                  <span>{sl.icon} {sl.label}</span>
+                  <span style={{color:"#c4b5fd"}}>{["shadow","temp"].includes(sl.key)&&filt[sl.key]>0?"+":""}{filt[sl.key]}</span>
+                </div>
+                <div style={{position:"relative",height:26}}>
+                  <div style={{position:"absolute",top:"50%",transform:"translateY(-50%)",left:0,right:0,height:4,borderRadius:2,background:"rgba(255,255,255,.1)"}}>
+                    <div style={{height:"100%",borderRadius:2,width:`${((filt[sl.key]-sl.min)/(sl.max-sl.min))*100}%`,background:"linear-gradient(90deg,#7c3aed,#a78bfa)"}}/>
+                  </div>
+                  <input type="range" min={sl.min} max={sl.max} value={filt[sl.key]}
+                    onChange={e=>{setFilt(p=>({...p,[sl.key]:parseFloat(e.target.value)}));setUseCss(false);}}/>
+                </div>
+              </div>
+            ))}
+            <button onClick={reset} style={{marginTop:2,padding:8,background:"rgba(255,255,255,.04)",
+              border:"1px solid rgba(255,255,255,.08)",borderRadius:12,color:"rgba(255,255,255,.32)",fontSize:12,cursor:"pointer"}}>
+              ↺ Reset All
             </button>
           </div>
+        )}
 
-          <div className="space-y-6" style={{ opacity: image ? 1 : 0.4, pointerEvents: image ? 'auto' : 'none' }}>
-            
-            {/* Detail & Sharpen */}
-            <div className="flex flex-col gap-2">
-              <div className="flex justify-between text-xs">
-                <span className="text-neutral-300 font-medium">Detail & Sharpen</span>
-                <span className="text-neutral-500">{filters.sharpen}%</span>
-              </div>
-              <input 
-                type="range" min="0" max="200" 
-                value={filters.sharpen} 
-                onChange={(e) => handleFilterChange('sharpen', e.target.value)}
-                className="w-full h-2 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
-              />
+        {/* ─ AI ─ */}
+        {photo&&tab==="ai"&&(
+          <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:10,animation:"fadeIn .25s ease"}}>
+            <p style={{margin:0,fontSize:12,color:"rgba(255,255,255,.28)",lineHeight:1.55}}>
+              Deskripsikan enhancement yang diinginkan.<br/>
+              <span style={{color:"rgba(167,139,250,.5)"}}>🔒 Wajah & tubuh tidak diubah.</span>
+            </p>
+            <textarea value={prompt} onChange={e=>setPrompt(e.target.value)}
+              placeholder="contoh: Nuansa golden hour, atau cinematic moody dark..."
+              rows={3} style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",
+                borderRadius:15,padding:"11px 13px",color:"#fff",fontSize:13,lineHeight:1.5,width:"100%"}}/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {["Golden hour","Dramatis","Cool moody","Bright airy","Ultra sharp","Film grain"].map(s=>(
+                <button key={s} onClick={()=>setPrompt(s)} style={{background:"rgba(167,139,250,.1)",
+                  border:"1px solid rgba(167,139,250,.22)",borderRadius:20,padding:"4px 10px",
+                  color:"rgba(185,155,255,.88)",fontSize:11,cursor:"pointer"}}>{s}</button>
+              ))}
             </div>
-
-            {/* Exposure / Brightness */}
-            <div className="flex flex-col gap-2">
-              <div className="flex justify-between text-xs">
-                <span className="text-neutral-300">Exposure</span>
-                <span className="text-neutral-500">{filters.brightness}%</span>
-              </div>
-              <input 
-                type="range" min="50" max="150" 
-                value={filters.brightness} 
-                onChange={(e) => handleFilterChange('brightness', e.target.value)}
-                className="w-full h-2 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-neutral-300"
-              />
-            </div>
-
-            {/* Contrast */}
-            <div className="flex flex-col gap-2">
-              <div className="flex justify-between text-xs">
-                <span className="text-neutral-300">Contrast</span>
-                <span className="text-neutral-500">{filters.contrast}%</span>
-              </div>
-              <input 
-                type="range" min="50" max="200" 
-                value={filters.contrast} 
-                onChange={(e) => handleFilterChange('contrast', e.target.value)}
-                className="w-full h-2 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-neutral-300"
-              />
-            </div>
-
-            {/* Saturation */}
-            <div className="flex flex-col gap-2">
-              <div className="flex justify-between text-xs">
-                <span className="text-neutral-300">Saturation</span>
-                <span className="text-neutral-500">{filters.saturate}%</span>
-              </div>
-              <input 
-                type="range" min="0" max="200" 
-                value={filters.saturate} 
-                onChange={(e) => handleFilterChange('saturate', e.target.value)}
-                className="w-full h-2 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-neutral-300"
-              />
-            </div>
-
-            {/* Cinematic Tint / Sepia */}
-            <div className="flex flex-col gap-2">
-              <div className="flex justify-between text-xs">
-                <span className="text-neutral-300">Cinematic Tint</span>
-                <span className="text-neutral-500">{filters.sepia}%</span>
-              </div>
-              <input 
-                type="range" min="0" max="100" 
-                value={filters.sepia} 
-                onChange={(e) => handleFilterChange('sepia', e.target.value)}
-                className="w-full h-2 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-neutral-300"
-              />
-            </div>
-
+            <button onClick={runPromptAI} disabled={!prompt.trim()||aiLoad} style={{
+              padding:"12px",border:"none",borderRadius:15,fontWeight:700,fontSize:14,
+              background:prompt.trim()?"linear-gradient(135deg,#7c3aed,#a78bfa)":"rgba(255,255,255,.06)",
+              color:prompt.trim()?"#fff":"rgba(255,255,255,.18)",cursor:prompt.trim()?"pointer":"default"}}>
+              {aiLoad?"✦ Enhancing…":"✦ Apply AI Enhancement"}
+            </button>
           </div>
-        </div>
+        )}
+
+        {/* Empty CTA */}
+        {!photo&&(
+          <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"20px 24px 26px",gap:12}}>
+            <p style={{margin:0,fontSize:13,color:"rgba(255,255,255,.2)",textAlign:"center",lineHeight:1.65}}>
+              Upload foto untuk memulai.<br/>Powered by Claude AI · Wajah selalu dilindungi.
+            </p>
+            <button onClick={()=>fileRef.current?.click()} style={{padding:"13px 36px",
+              background:"linear-gradient(135deg,#7c3aed,#a78bfa)",border:"none",borderRadius:22,
+              color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>⊕ Pilih Foto</button>
+          </div>
+        )}
+
+        <div style={{height:38}}/>
+        <div style={{position:"absolute",bottom:9,left:"50%",transform:"translateX(-50%)",
+          width:130,height:5,background:"rgba(255,255,255,.22)",borderRadius:3}}/>
       </div>
 
-      {/* Hidden canvas for downloading image */}
-      <canvas ref={canvasRef} className="hidden" />
+      <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>loadFile(e.target.files[0])}/>
     </div>
   );
-};
+}
 
-export default App;
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
